@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Dead Orbit
+Comment=Zero-g salvage horror-comedy
+Exec=dead-orbit
+Terminal=false
+Categories=Game;ActionGame;
