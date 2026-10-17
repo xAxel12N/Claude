@@ -51,6 +51,22 @@ double model_forward(const Model *m, Work *w, const int *tok, const int *tgt, in
 void model_backward(const Model *m, Work *w, const int *tok, const int *tgt, int n, double scale);
 int model_sample(const Model *m, Work *w, const int *ctx, int n, double temp, uint64_t *rng);
 
+/* A snapshot of what the brain does with a short text, for drawing it. */
+#define INS_T 24 /* tokens */
+#define INS_L 6  /* blocks */
+#define INS_N 16 /* neurons per block */
+typedef struct {
+    int n, L;
+    unsigned char ch[INS_T];
+    float emb_amp[INS_T][4], emb_ph[INS_T][4];     /* first 4 wave components of each token */
+    float att[INS_L][INS_T][INS_T];                /* head-averaged weight of token t on token s */
+    float act_amp[INS_L][INS_N], act_ph[INS_L][INS_N]; /* modReLU neurons for the last token */
+    float gate[INS_L][INS_N];                      /* first gate angles of each circuit */
+    int top_ch[8];                                 /* most likely next characters */
+    float top_p[8];
+} Inspect;
+void model_inspect(const Model *m, Work *w, const int *tok, int n, const unsigned char *itos, Inspect *ins);
+
 /* ---------- optimisation ---------- */
 enum { OPT_SGD, OPT_MOMENTUM, OPT_ADAM, OPT_ADAMW };
 enum { SCHED_CONST, SCHED_COSINE, SCHED_STEP };
@@ -72,13 +88,18 @@ void opt_free(OptState *s);
 double opt_lr(const OptCfg *o, long step);
 double opt_clip(double *g, size_t n, double clip);
 void opt_step(const OptCfg *o, OptState *s, const Model *m, const double *g, double lr, uint64_t *rng);
+int learn_threads(int want); /* OpenMP threads to use (want <= 0: all cores) */
+/* One batch: fills work_grad(ws[0]) with the mean gradient over B sequences, returns the mean loss. */
+double learn_batch(const Model *m, Work **ws, int nth, const int *X, const int *Y, int B, int T);
+struct Data;
+double learn_eval(const Model *m, Work **ws, int nth, const struct Data *d, int nseq, uint64_t *rng);
 int opt_parse(const char *name);
 int sched_parse(const char *name);
 const char *opt_name(int type);
 const char *sched_name(int sched);
 
 /* ---------- data & checkpoints ---------- */
-typedef struct {
+typedef struct Data {
     int V;
     unsigned char itos[256];
     int stoi[256];
@@ -88,6 +109,9 @@ typedef struct {
 } Data;
 
 int data_load(Data *d, const char *path, int T);
+/* Joins several text files. With a vocab, its alphabet is kept and unknown bytes are dropped
+ * (counted in *dropped); without one, the alphabet is built from the texts. */
+int data_load_files(Data *d, const char *const *paths, int np, const Data *vocab, int T, long *dropped);
 void data_free(Data *d);
 void data_batch(const Data *d, int val, int T, int *x, int *y, uint64_t *rng);
 int data_encode(const Data *d, const char *s, int *out, int max);

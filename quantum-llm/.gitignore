@@ -5,3 +5,6 @@ data/
 *.tmp
 train.log
 .quantum.pid
+third_party/
+texts/
+*.png

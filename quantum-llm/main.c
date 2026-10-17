@@ -8,9 +8,6 @@
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
-#ifdef _OPENMP
-#include <omp.h>
-#endif
 
 typedef struct {
     const char *mode, *data, *ckpt, *prompt;
@@ -79,56 +76,7 @@ static void nap(int ms)
     nanosleep(&ts, NULL);
 }
 
-static int nthreads(int want)
-{
-#ifdef _OPENMP
-    return want > 0 ? want : omp_get_max_threads();
-#else
-    (void)want;
-    return 1;
-#endif
-}
-
-static int thread_id(void)
-{
-#ifdef _OPENMP
-    return omp_get_thread_num();
-#else
-    return 0;
-#endif
-}
-
 /* ---------- training ---------- */
-
-static double train_step(const Model *m, Work **ws, int nth, const int *X, const int *Y, int B, int T)
-{
-    double loss = 0;
-    for (int i = 0; i < nth; i++) memset(work_grad(ws[i]), 0, m->n * sizeof(double));
-#pragma omp parallel for num_threads(nth) schedule(dynamic, 1) reduction(+ : loss)
-    for (int b = 0; b < B; b++) {
-        Work *w = ws[thread_id()];
-        loss += model_forward(m, w, X + b * T, Y + b * T, T);
-        model_backward(m, w, X + b * T, Y + b * T, T, 1.0 / B);
-    }
-    double *g = work_grad(ws[0]);
-#pragma omp parallel for num_threads(nth) schedule(static)
-    for (long i = 0; i < (long)m->n; i++)
-        for (int t = 1; t < nth; t++) g[i] += work_grad(ws[t])[i];
-    return loss / B;
-}
-
-static double evaluate(const Model *m, Work **ws, int nth, const Data *d, int nseq, uint64_t *rng)
-{
-    int T = m->c.T;
-    int *X = malloc(sizeof(int) * nseq * T), *Y = malloc(sizeof(int) * nseq * T);
-    for (int b = 0; b < nseq; b++) data_batch(d, 1, T, X + b * T, Y + b * T, rng);
-    double loss = 0;
-#pragma omp parallel for num_threads(nth) schedule(dynamic, 1) reduction(+ : loss)
-    for (int b = 0; b < nseq; b++) loss += model_forward(m, ws[thread_id()], X + b * T, Y + b * T, T);
-    free(X);
-    free(Y);
-    return loss / nseq;
-}
 
 static void generate(const Model *m, Work *w, const Data *d, const char *prompt, int len, double temp,
                      uint64_t *rng)
@@ -184,7 +132,7 @@ static int run_train(Args *a)
         if (model_init(&m, a->c, &rng) || opt_init(&s, m.n)) return 1;
     }
     Config c = m.c;
-    int T = c.T, B = a->batch, nth = nthreads(a->threads);
+    int T = c.T, B = a->batch, nth = learn_threads(a->threads);
     if (a->o.min_lr < 0) a->o.min_lr = a->o.lr * 0.1;
 
     printf("QuantumGPT | %zu real parameters | vocab %d | width %d complex | heads %d | blocks %d | context %d | "
@@ -237,7 +185,7 @@ static int run_train(Args *a)
 
         for (int b = 0; b < B; b++) data_batch(&d, 0, T, X + b * T, Y + b * T, &rng);
         double lr = opt_lr(&a->o, step);
-        loss = train_step(&m, ws, nth, X, Y, B, T);
+        loss = learn_batch(&m, ws, nth, X, Y, B, T);
         gn = opt_clip(work_grad(ws[0]), m.n, a->o.clip);
         opt_step(&a->o, &s, &m, work_grad(ws[0]), lr, &rng);
         step++;
@@ -250,7 +198,7 @@ static int run_train(Args *a)
 
         int last = step == a->o.steps;
         if (step % a->eval_every == 0 || last) {
-            val = evaluate(&m, ws, nth, &d, 4 * B, &rng);
+            val = learn_eval(&m, ws, nth, &d, 4 * B, &rng);
             if (val < best) {
                 best = val;
                 char path[1024];

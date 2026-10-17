@@ -433,6 +433,50 @@ void model_backward(const Model *m, Work *w, const int *tok, const int *tgt, int
         for (int k = 0; k < D; k++) gE[(size_t)tok[t] * D + k] += conj(pos_phase(t, k, D)) * w->gx[t * D + k];
 }
 
+void model_inspect(const Model *m, Work *w, const int *tok, int n, const unsigned char *itos, Inspect *ins)
+{
+    const Config *c = &m->c;
+    int D = c->D, T = c->T, J = 2 * c->R;
+    if (n > INS_T) tok += n - INS_T, n = INS_T;
+    if (n > T) tok += n - T, n = T;
+    memset(ins, 0, sizeof *ins);
+    if (n < 1) return;
+    model_forward(m, w, tok, NULL, n);
+    ins->n = n;
+    ins->L = c->L < INS_L ? c->L : INS_L;
+    for (int t = 0; t < n; t++) {
+        ins->ch[t] = itos[tok[t]];
+        for (int k = 0; k < 4 && k < D; k++) {
+            cpx x = w->bc[0].x[t * D + k];
+            ins->emb_amp[t][k] = cabs(x);
+            ins->emb_ph[t][k] = carg(x);
+        }
+    }
+    for (int l = 0; l < ins->L; l++) {
+        const Cache *b = &w->bc[l];
+        for (int h = 0; h < c->H; h++)
+            for (int t = 0; t < n; t++)
+                for (int s = 0; s <= t; s++) ins->att[l][t][s] += b->a[((size_t)h * T + t) * T + s] / c->H;
+        for (int k = 0; k < INS_N && k < D; k++) {
+            cpx v = b->m[(n - 1) * D + k];
+            ins->act_amp[l][k] = cabs(v);
+            ins->act_ph[l][k] = carg(v);
+            ins->gate[l][k] = J > 0 && k < D / 2 ? m->p[m->blk[l].theta + k] : 0;
+        }
+    }
+    const double *p = w->prob + (size_t)(n - 1) * c->V;
+    for (int i = 0; i < 8; i++) {
+        int best = -1;
+        for (int v = 0; v < c->V; v++) {
+            int used = 0;
+            for (int j = 0; j < i; j++) used |= ins->top_ch[j] == itos[v];
+            if (!used && (best < 0 || p[v] > p[best])) best = v;
+        }
+        ins->top_ch[i] = best < 0 ? ' ' : itos[best];
+        ins->top_p[i] = best < 0 ? 0 : p[best];
+    }
+}
+
 int model_sample(const Model *m, Work *w, const int *ctx, int n, double temp, uint64_t *rng)
 {
     int V = m->c.V;

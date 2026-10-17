@@ -4,6 +4,63 @@
 #include <math.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _OPENMP
+#include <omp.h>
+#endif
+
+int learn_threads(int want)
+{
+#ifdef _OPENMP
+    return want > 0 ? want : omp_get_max_threads();
+#else
+    (void)want;
+    return 1;
+#endif
+}
+
+static int thread_id(void)
+{
+#ifdef _OPENMP
+    return omp_get_thread_num();
+#else
+    return 0;
+#endif
+}
+
+double learn_batch(const Model *m, Work **ws, int nth, const int *X, const int *Y, int B, int T)
+{
+    double loss = 0;
+    for (int i = 0; i < nth; i++) memset(work_grad(ws[i]), 0, m->n * sizeof(double));
+#pragma omp parallel for num_threads(nth) schedule(dynamic, 1) reduction(+ : loss)
+    for (int b = 0; b < B; b++) {
+        Work *w = ws[thread_id()];
+        loss += model_forward(m, w, X + b * T, Y + b * T, T);
+        model_backward(m, w, X + b * T, Y + b * T, T, 1.0 / B);
+    }
+    double *g = work_grad(ws[0]);
+#pragma omp parallel for num_threads(nth) schedule(static)
+    for (long i = 0; i < (long)m->n; i++)
+        for (int t = 1; t < nth; t++) g[i] += work_grad(ws[t])[i];
+    return loss / B;
+}
+
+double learn_eval(const Model *m, Work **ws, int nth, const Data *d, int nseq, uint64_t *rng)
+{
+    int T = m->c.T;
+    int *X = malloc(sizeof(int) * nseq * T), *Y = malloc(sizeof(int) * nseq * T);
+    if (!X || !Y) {
+        free(X);
+        free(Y);
+        return NAN;
+    }
+    for (int b = 0; b < nseq; b++) data_batch(d, 1, T, X + b * T, Y + b * T, rng);
+    double loss = 0;
+#pragma omp parallel for num_threads(nth) schedule(dynamic, 1) reduction(+ : loss)
+    for (int b = 0; b < nseq; b++) loss += model_forward(m, ws[thread_id()], X + b * T, Y + b * T, T);
+    free(X);
+    free(Y);
+    return loss / nseq;
+}
 
 double rng_normal(uint64_t *s)
 {
