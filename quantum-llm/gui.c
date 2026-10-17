@@ -4,6 +4,7 @@
 #include "raylib.h"
 #undef Model
 #include "qcore.h"
+#include "gpu.h"
 #include "sensors.h"
 #include <dirent.h>
 #include <math.h>
@@ -71,6 +72,8 @@ static struct {
     Msg chat[MAXMSG];
     int nchat, generating;
     double creativity;
+    int use_gpu, gpu_ok;
+    char dev_label[200];
     Config cur; /* shape of the current brain, for display */
 } A;
 
@@ -342,9 +345,20 @@ static void reload(int fresh, uint64_t *rng)
         note("Learning from %d file(s), %ld characters", np, nd.n);
 }
 
+/* The graphics card, when training runs there (trainer thread only). */
+static Gpu *g_gpu;
+static int g_on_gpu, g_gpu_id = -1, g_gpu_B;
+
+/* While the card holds the weights, refresh the CPU copy. Call with model_mu held. */
+static void sync_from_gpu(int with_opt)
+{
+    if (g_on_gpu && g_gpu_id == A.brain_id) gpu_pull(g_gpu, &A.m, with_opt ? &A.s : NULL);
+}
+
 static void save_brain(void)
 {
     pthread_mutex_lock(&A.model_mu);
+    sync_from_gpu(1);
     int ok = A.have_model && !ckpt_save(CKPT, &A.m, &A.s, &A.voc, A.step, A.best);
     pthread_mutex_unlock(&A.model_mu);
     if (ok) note("Saved the brain to " CKPT);
@@ -359,6 +373,7 @@ static void inspect(void)
     Inspect ins;
     int tok[128];
     pthread_mutex_lock(&A.model_mu);
+    sync_from_gpu(0);
     int n = A.have_model ? data_encode(&A.voc, probe, tok, 128) : 0;
     if (n > 0) model_inspect(&A.m, A.gw, tok, n, A.voc.itos, &ins);
     pthread_mutex_unlock(&A.model_mu);
@@ -392,6 +407,13 @@ static void *trainer(void *arg)
     uint64_t rng = (uint64_t)time(NULL) | 1;
     int *X = NULL, *Y = NULL, cap = 0;
     double last_inspect = 0;
+    char gerr[256];
+    g_gpu = gpu_open(gerr, sizeof gerr);
+    pthread_mutex_lock(&A.mu);
+    A.gpu_ok = g_gpu != NULL;
+    snprintf(A.dev_label, sizeof A.dev_label, "%s", g_gpu ? gpu_name(g_gpu) : gerr);
+    if (g_gpu) A.use_gpu = 1, A.batch = 64; /* a card likes big batches */
+    pthread_mutex_unlock(&A.mu);
 
     if (access(CKPT, F_OK) == 0) {
         Data voc;
@@ -420,11 +442,15 @@ static void *trainer(void *arg)
         int save = A.want_save, insp = A.want_inspect;
         A.want_reload = A.want_reset = A.want_save = A.want_inspect = 0;
         OptCfg o = A.o;
-        int B = A.batch, eval_every = A.eval_every;
+        int B = A.batch, eval_every = A.eval_every, use_gpu = A.use_gpu;
         long step = A.step;
         pthread_mutex_unlock(&A.mu);
         if (quit) break;
         if (reload_now) reload(fresh, &rng);
+        pthread_mutex_lock(&A.model_mu);
+        if (g_on_gpu && g_gpu_id != A.brain_id) g_on_gpu = 0; /* that brain was replaced */
+        if (g_on_gpu && (!use_gpu || g_gpu_B != B)) gpu_pull(g_gpu, &A.m, &A.s), g_on_gpu = 0;
+        pthread_mutex_unlock(&A.model_mu);
         if (save) save_brain();
         if (insp || (running && now() - last_inspect > 0.8)) inspect(), last_inspect = now();
         if (!running || !A.have_model || !A.have_data) {
@@ -440,6 +466,21 @@ static void *trainer(void *arg)
             continue;
         }
 
+        pthread_mutex_lock(&A.model_mu);
+        int bind_failed = 0;
+        if (use_gpu && g_gpu && !g_on_gpu) {
+            if (gpu_bind(g_gpu, &A.m, &A.s, B) == 0) g_on_gpu = 1, g_gpu_id = A.brain_id, g_gpu_B = B;
+            else bind_failed = 1;
+        }
+        pthread_mutex_unlock(&A.model_mu);
+        if (bind_failed) {
+            pthread_mutex_lock(&A.mu);
+            A.use_gpu = 0;
+            pthread_mutex_unlock(&A.mu);
+            note("GPU: %s - training on the CPU instead", gpu_error(g_gpu));
+            continue;
+        }
+
         double t0 = now();
         pthread_mutex_lock(&A.model_mu);
         int T = A.m.c.T;
@@ -449,17 +490,39 @@ static void *trainer(void *arg)
             Y = realloc(Y, sizeof(int) * cap);
         }
         for (int b = 0; b < B; b++) data_batch(&A.d, 0, T, X + b * T, Y + b * T, &rng);
-        double lr = opt_lr(&o, step);
-        double loss = learn_batch(&A.m, A.ws, A.nth, X, Y, B, T);
-        opt_clip(work_grad(A.ws[0]), A.m.n, o.clip);
-        opt_step(&o, &A.s, &A.m, work_grad(A.ws[0]), lr, &rng);
+        double lr = opt_lr(&o, step), loss;
+        int gpu_failed = 0;
+        if (g_on_gpu) {
+            loss = gpu_step(g_gpu, &A.m, &A.s, X, Y, &o, lr, NULL, &rng);
+            gpu_failed = !isfinite(loss) && gpu_error(g_gpu)[0];
+        } else {
+            loss = learn_batch(&A.m, A.ws, A.nth, X, Y, B, T);
+            opt_clip(work_grad(A.ws[0]), A.m.n, o.clip);
+            opt_step(&o, &A.s, &A.m, work_grad(A.ws[0]), lr, &rng);
+        }
         step++;
         double val = NAN;
-        if (step % eval_every == 0) {
-            val = learn_eval(&A.m, A.ws, A.nth, &A.d, 4 * B, &rng);
+        if (step % eval_every == 0 && !gpu_failed) {
+            if (g_on_gpu) {
+                val = 0;
+                for (int e = 0; e < 4; e++) {
+                    for (int b = 0; b < B; b++) data_batch(&A.d, 1, T, X + b * T, Y + b * T, &rng);
+                    val += gpu_eval(g_gpu, &A.m, X, Y) / 4;
+                }
+                gpu_pull(g_gpu, &A.m, &A.s);
+            } else
+                val = learn_eval(&A.m, A.ws, A.nth, &A.d, 4 * B, &rng);
             sample_text(&rng);
         }
+        if (gpu_failed) g_on_gpu = 0;
         pthread_mutex_unlock(&A.model_mu);
+        if (gpu_failed) {
+            pthread_mutex_lock(&A.mu);
+            A.use_gpu = 0, A.running = 0;
+            pthread_mutex_unlock(&A.mu);
+            note("GPU: %s - switched to the CPU, press START to go on", gpu_error(g_gpu));
+            continue;
+        }
 
         pthread_mutex_lock(&A.mu);
         double dt = now() - t0, tps = B * T / (dt + 1e-9);
@@ -488,6 +551,7 @@ static void *trainer(void *arg)
         }
     }
     save_brain();
+    gpu_close(g_gpu);
     free(X);
     free(Y);
     return NULL;
@@ -1001,7 +1065,9 @@ int main(void)
         snprintf(note_s, sizeof note_s, "%s", now() - A.note_t < 8 ? A.note : "");
         snprintf(sample, sizeof sample, "%s", A.sample);
         snprintf(probe, sizeof probe, "%s", A.probe);
-        int have_model = A.have_model;
+        int have_model = A.have_model, use_gpu = A.use_gpu, gpu_ok = A.gpu_ok;
+        char dev_label[200];
+        snprintf(dev_label, sizeof dev_label, "%s", A.dev_label);
         pthread_mutex_unlock(&A.mu);
         SensorSnap hw;
         sensors_get(&hw);
@@ -1013,8 +1079,9 @@ int main(void)
         /* top bar */
         txt("QuantumGPT", 18, 12, 28, FG);
         char dev[160];
-        if (hw.gpu_name[0]) snprintf(dev, sizeof dev, "training on CPU, %d threads  |  GPU found: %s", learn_threads(0), hw.gpu_name);
-        else snprintf(dev, sizeof dev, "training on CPU, %d threads", learn_threads(0));
+        if (use_gpu) snprintf(dev, sizeof dev, "training on the GPU: %s", dev_label);
+        else if (gpu_ok) snprintf(dev, sizeof dev, "training on CPU, %d threads  |  GPU available: %s", learn_threads(0), dev_label);
+        else snprintf(dev, sizeof dev, "training on CPU, %d threads  |  no GPU: %s", learn_threads(0), dev_label);
         txt(dev, 20, 44, 14, DIM);
         float bx = W - 12;
         Rectangle rstop = {bx -= 170, 12, 160, 40}, rpause = {bx -= 132, 12, 122, 40}, rstart = {bx -= 132, 12, 122, 40};
@@ -1092,14 +1159,18 @@ int main(void)
             if (system("xdg-open " TEXT_DIR " >/dev/null 2>&1 &")) note("Could not open the folder");
 
         /* learning settings */
-        Rectangle rl = {left.x, rt.y + th + gap, lw, 214};
+        Rectangle rl = {left.x, rt.y + th + gap, lw, 243};
         panel(rl, "Learning");
         float sx = rl.x + 14, sw = lw - 28;
         y = rl.y + 40;
         char v[48];
         int d;
         pthread_mutex_lock(&A.mu);
-        if (chooser(sx, y, sw, "Optimiser", opt_name(o.type))) A.o.type = (A.o.type + 1) % 4;
+        if (chooser(sx, y, sw, "Device", use_gpu ? "GPU" : "CPU")) {
+            if (A.gpu_ok) A.use_gpu = !A.use_gpu;
+            else snprintf(A.note, sizeof A.note, "No GPU: %s", A.dev_label), A.note_t = now();
+        }
+        if (chooser(sx, y += 29, sw, "Optimiser", opt_name(o.type))) A.o.type = (A.o.type + 1) % 4;
         if (chooser(sx, y += 29, sw, "Schedule", sched_name(o.sched))) A.o.sched = (A.o.sched + 1) % 3;
         snprintf(v, sizeof v, "%.1e", o.lr);
         if ((d = stepper(sx, y += 29, sw, "Learning rate", v))) {

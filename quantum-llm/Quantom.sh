@@ -5,7 +5,8 @@
 #   ./Quantom.sh            menu with start / stop buttons
 #   ./Quantom.sh train      train here with live keys (SPACE start/stop, g sample, q quit)
 #   ./Quantom.sh start      train in the background      ./Quantom.sh stop     save and stop it
-#   ./Quantom.sh pause | resume | status | sample | gradcheck | build | clean
+#   ./Quantom.sh pause | resume | status | sample | gradcheck | gpucheck | build | clean
+#   ./Quantom.sh train --gpu   train on the graphics card (the window has a Device: GPU switch)
 #
 # Extra options go straight to the program, e.g.
 #   ./Quantom.sh start --opt momentum --sched step --anneal 0.5 --steps 6000
@@ -54,7 +55,7 @@ syslib() {
 
 build_gui() {
     need_raylib
-    local cc=${CC:-cc} src=(gui.c sensors.c model.c optim.c data.c) libs
+    local cc=${CC:-cc} src=(gui.c sensors.c model.c optim.c data.c gpu.c) libs
     libs=("$RAYLIB/lib/libraylib.a" "$(syslib libGL)" "$(syslib libX11)" -lm -lpthread -ldl -lrt)
     mkdir -p build
     echo "building the window ..."
@@ -69,7 +70,7 @@ build_gui() {
 
 gui() {
     local f fresh=0
-    for f in gui.c sensors.c sensors.h model.c optim.c data.c qcore.h; do [[ $f -nt $GUI ]] && fresh=1; done
+    for f in gui.c sensors.c sensors.h model.c optim.c data.c gpu.c gpu.h qcore.h; do [[ $f -nt $GUI ]] && fresh=1; done
     [[ -x $GUI && $fresh == 0 ]] || build_gui
     mkdir -p texts
     if ! ls texts/*.txt texts/*.md >/dev/null 2>&1; then # start with Shakespeare so there is something to learn
@@ -81,12 +82,12 @@ gui() {
 }
 
 build() {
-    local cc=${CC:-cc} src=(main.c model.c optim.c data.c)
+    local cc=${CC:-cc} src=(main.c model.c optim.c data.c gpu.c)
     mkdir -p build
     echo "building with $cc ..."
-    if ! "$cc" -O3 -march=native -fcx-limited-range -fopenmp -std=gnu11 -o "$BIN" "${src[@]}" -lm 2>/dev/null; then
+    if ! "$cc" -O3 -march=native -fcx-limited-range -fopenmp -std=gnu11 -o "$BIN" "${src[@]}" -lm -ldl 2>/dev/null; then
         echo "  (no OpenMP / native flags - building single-threaded)"
-        "$cc" -O2 -std=gnu11 -o "$BIN" "${src[@]}" -lm
+        "$cc" -O2 -std=gnu11 -o "$BIN" "${src[@]}" -lm -ldl
     fi
     echo "built $BIN"
 }
@@ -94,7 +95,7 @@ build() {
 need_build() {
     local f
     [[ -x $BIN ]] || { build; return; }
-    for f in main.c model.c optim.c data.c qcore.h; do
+    for f in main.c model.c optim.c data.c gpu.c gpu.h qcore.h; do
         [[ $f -nt $BIN ]] && { build; return; }
     done
     return 0
@@ -208,8 +209,9 @@ resume) signal USR2 "resumed" ;;
 status) status ;;
 sample) sample "$@" ;;
 gradcheck) need_build; "$BIN" gradcheck ;;
+gpucheck) need_build; "$BIN" gpucheck ;;
 clean) rm -rf build "$CKPT" "$CKPT.best" "$LOG" "$PIDFILE" ;;
 menu) menu ;;
-help | -h | --help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//' ;;
-*) echo "unknown command $cmd"; sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+help | -h | --help) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+*) echo "unknown command $cmd"; sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

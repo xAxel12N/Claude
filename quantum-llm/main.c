@@ -1,4 +1,5 @@
 /* main.c - QuantumGPT command line: train (with live start/stop controls), sample, gradcheck. */
+#include "gpu.h"
 #include "qcore.h"
 #include <math.h>
 #include <signal.h>
@@ -13,7 +14,7 @@ typedef struct {
     const char *mode, *data, *ckpt, *prompt;
     Config c;
     OptCfg o;
-    int batch, threads, eval_every, len, fresh, autostart;
+    int batch, threads, eval_every, len, fresh, autostart, gpu;
     double temp;
     uint64_t seed;
 } Args;
@@ -147,6 +148,19 @@ static int run_train(Args *a)
     Work **ws = malloc(sizeof *ws * nth);
     for (int i = 0; i < nth; i++) ws[i] = work_new(&m);
     int *X = malloc(sizeof(int) * B * T), *Y = malloc(sizeof(int) * B * T);
+    Gpu *gpu = NULL;
+    if (a->gpu) {
+        char err[512];
+        if (!(gpu = gpu_open(err, sizeof err))) {
+            fprintf(stderr, "GPU: %s\n", err);
+            return 1;
+        }
+        if (gpu_bind(gpu, &m, &s, B)) {
+            fprintf(stderr, "GPU: %s\n", gpu_error(gpu));
+            return 1;
+        }
+        printf("training on the GPU: %s\n", gpu_name(gpu));
+    }
 
     install_signals();
     tty_raw();
@@ -170,6 +184,7 @@ static int run_train(Args *a)
         }
         if (g_pause) g_pause = 0, paused = 1, status(1, step, a->o.steps, loss, val, best, opt_lr(&a->o, step), gn, tps);
         if (g_resume) g_resume = 0, paused = 0;
+        if (gpu && (want_sample || want_save)) gpu_pull(gpu, &m, &s);
         if (want_sample) {
             printf("\n--- sample ---\n");
             generate(&m, ws[0], &d, "", 300, a->temp, &rng);
@@ -185,9 +200,14 @@ static int run_train(Args *a)
 
         for (int b = 0; b < B; b++) data_batch(&d, 0, T, X + b * T, Y + b * T, &rng);
         double lr = opt_lr(&a->o, step);
-        loss = learn_batch(&m, ws, nth, X, Y, B, T);
-        gn = opt_clip(work_grad(ws[0]), m.n, a->o.clip);
-        opt_step(&a->o, &s, &m, work_grad(ws[0]), lr, &rng);
+        if (gpu) {
+            loss = gpu_step(gpu, &m, &s, X, Y, &a->o, lr, &gn, &rng);
+            if (!isfinite(loss) && gpu_error(gpu)[0]) fprintf(stderr, "\nGPU: %s\n", gpu_error(gpu));
+        } else {
+            loss = learn_batch(&m, ws, nth, X, Y, B, T);
+            gn = opt_clip(work_grad(ws[0]), m.n, a->o.clip);
+            opt_step(&a->o, &s, &m, work_grad(ws[0]), lr, &rng);
+        }
         step++;
         tok_count += (long)B * T;
         tps = tok_count / (now() - t0 + 1e-9);
@@ -198,7 +218,15 @@ static int run_train(Args *a)
 
         int last = step == a->o.steps;
         if (step % a->eval_every == 0 || last) {
-            val = learn_eval(&m, ws, nth, &d, 4 * B, &rng);
+            if (gpu) {
+                val = 0;
+                for (int e = 0; e < 4; e++) {
+                    for (int b = 0; b < B; b++) data_batch(&d, 1, T, X + b * T, Y + b * T, &rng);
+                    val += gpu_eval(gpu, &m, X, Y) / 4;
+                }
+                gpu_pull(gpu, &m, &s);
+            } else
+                val = learn_eval(&m, ws, nth, &d, 4 * B, &rng);
             if (val < best) {
                 best = val;
                 char path[1024];
@@ -213,6 +241,7 @@ static int run_train(Args *a)
             status(paused, step, a->o.steps, loss, val, best, lr, gn, tps);
         }
     }
+    if (gpu) gpu_pull(gpu, &m, &s), gpu_close(gpu);
     ckpt_save(a->ckpt, &m, &s, &d, step, best);
     printf("\nstopped at step %ld, saved %s (best validation loss %.3f)\n", step, a->ckpt, best);
 
@@ -224,6 +253,46 @@ static int run_train(Args *a)
     model_free(&m);
     data_free(&d);
     return 0;
+}
+
+/* Checks the GPU against the CPU: same batch, same weights, compare loss and gradient. */
+static int run_gpucheck(uint64_t seed)
+{
+    char err[512];
+    Gpu *gpu = gpu_open(err, sizeof err);
+    if (!gpu) {
+        printf("gpucheck: %s\n", err);
+        return 1;
+    }
+    printf("gpucheck on %s\n", gpu_name(gpu));
+    int ok = 1;
+    Config shapes[] = {{.V = 11, .D = 8, .H = 2, .L = 2, .T = 7, .R = 1}, {.V = 65, .D = 64, .H = 4, .L = 2, .T = 64, .R = 2}};
+    for (int k = 0; k < 2; k++) {
+        Config c = shapes[k];
+        int B = 3, nth = 1;
+        Model m;
+        uint64_t rng = seed + k;
+        if (model_init(&m, c, &rng)) return 1;
+        Work *w = work_new(&m);
+        int *X = malloc(sizeof(int) * B * c.T), *Y = malloc(sizeof(int) * B * c.T);
+        for (int i = 0; i < B * c.T; i++) X[i] = rng_u64(&rng) % c.V, Y[i] = rng_u64(&rng) % c.V;
+        double cpu_loss = learn_batch(&m, &w, nth, X, Y, B, c.T), gpu_loss, *gg = malloc(sizeof(double) * m.n);
+        const double *cg = work_grad(w);
+        if (gpu_bind(gpu, &m, NULL, B) || gpu_grad(gpu, &m, X, Y, gg, &gpu_loss)) {
+            printf("  GPU error: %s\n", gpu_error(gpu));
+            return 1;
+        }
+        double num = 0, den = 0;
+        for (size_t i = 0; i < m.n; i++) num += (gg[i] - cg[i]) * (gg[i] - cg[i]), den += cg[i] * cg[i];
+        double rel = sqrt(num / (den + 1e-30));
+        int pass = fabs(gpu_loss - cpu_loss) < 1e-3 * fabs(cpu_loss) + 1e-4 && rel < 1e-3;
+        printf("  width %3d: loss CPU %.6f GPU %.6f | gradient difference %.1e -> %s\n", c.D, cpu_loss, gpu_loss, rel,
+               pass ? "PASS" : "FAIL");
+        ok &= pass;
+        free(gg), free(X), free(Y), work_free(w), model_free(&m);
+    }
+    gpu_close(gpu);
+    return !ok;
 }
 
 static int run_sample(Args *a)
@@ -277,11 +346,12 @@ static int run_gradcheck(uint64_t seed)
 
 static void usage(void)
 {
-    puts("usage: quantum <train|sample|gradcheck> [options]\n"
+    puts("usage: quantum <train|sample|gradcheck|gpucheck> [options]\n"
          "  --data FILE      training text (data/input.txt)\n"
          "  --ckpt FILE      checkpoint (quantum.ckpt); training resumes from it\n"
          "  --fresh          ignore an existing checkpoint\n"
          "  --start          start training at once instead of waiting for SPACE\n"
+         "  --gpu            train on the graphics card (OpenCL)\n"
          "model:    --width 64 --heads 4 --layers 2 --ctx 64 --circuit 2\n"
          "learning: --steps 3000 --batch 16 --lr 3e-3 --min-lr X --opt sgd|momentum|adam|adamw\n"
          "          --sched const|cosine|step --warmup 100 --wd 0.01 --clip 1 --anneal 0\n"
@@ -302,6 +372,7 @@ int main(int argc, char **argv)
         if (!strcmp(k, "-h") || !strcmp(k, "--help")) return usage(), 0;
         else if (!strcmp(k, "--fresh")) a.fresh = 1;
         else if (!strcmp(k, "--start")) a.autostart = 1;
+        else if (!strcmp(k, "--gpu")) a.gpu = 1;
         else if (OPT("--data")) a.data = v;
         else if (OPT("--ckpt")) a.ckpt = v;
         else if (OPT("--prompt")) a.prompt = v;
@@ -340,6 +411,7 @@ int main(int argc, char **argv)
     if (!a.mode || !strcmp(a.mode, "train")) return run_train(&a);
     if (!strcmp(a.mode, "sample")) return run_sample(&a);
     if (!strcmp(a.mode, "gradcheck")) return run_gradcheck(a.seed);
+    if (!strcmp(a.mode, "gpucheck")) return run_gpucheck(a.seed);
     usage();
     return 2;
 }
