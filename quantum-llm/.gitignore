@@ -1,0 +1,7 @@
+build/
+data/
+*.ckpt
+*.ckpt.best
+*.tmp
+train.log
+.quantum.pid
